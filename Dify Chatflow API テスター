@@ -1,0 +1,441 @@
+#!/usr/bin/env python3
+"""
+Dify Chatflow API テスター
+==========================
+チャットフローに対しテストケースを連続投入し、
+LLM回答 + Question Classifier の分岐結果をログ出力する。
+
+使い方:
+  1. CONFIG セクションの API_URL / API_KEY を設定
+  2. テストケースを INLINE_CASES に直書き、または Excel ファイルを指定
+  3. python dify_chatflow_tester.py
+
+Excel 形式:
+  | query | expected_class | memo |
+  query: 質問文 (必須)
+  expected_class: 期待する分類名 (任意、空欄可)
+  memo: メモ (任意)
+"""
+
+import json
+import time
+import sys
+import logging
+from dataclasses import dataclass, field
+from pathlib import Path
+from datetime import datetime
+
+import requests
+
+# ============================================================
+# CONFIG — ここを編集してください
+# ============================================================
+API_URL = "http://localhost/v1/chat-messages"  # Dify の Service API エンドポイント
+API_KEY = "app-xxxxxxxxxxxxxxxxxxxxxxxx"       # アプリの API Key
+
+# テスト実行ユーザー識別子 (Dify 側でログが分離される)
+TEST_USER = "debug-tester"
+
+# inputs: チャットフローの Start ノードで定義した変数があればここに
+INPUTS: dict = {}
+
+# リクエスト間隔 (秒) — セルフホストでも礼儀として少し空ける
+REQUEST_INTERVAL = 1.0
+
+# 会話を毎回リセットするか、同一会話で連続するか
+RESET_CONVERSATION_PER_CASE = True
+
+# Excel ファイルパス (None ならインラインケースのみ使用)
+EXCEL_PATH: str | None = None  # 例: r"S:\test\chatflow_cases.xlsx"
+EXCEL_SHEET: str | None = None  # シート名 (None = 先頭シート)
+
+# ログ出力先 (None = カレントディレクトリに自動生成)
+LOG_DIR: str | None = None
+
+# ============================================================
+# INLINE TEST CASES — Excel を使わない場合はここに直書き
+# ============================================================
+INLINE_CASES: list[dict] = [
+    # --- サンプル: 自分のフローに合わせて書き換えてください ---
+    {
+        "query": "商品の返品方法を教えてください",
+        "expected_class": "返品・交換",
+        "memo": "基本的な返品質問",
+    },
+    {
+        "query": "営業時間は何時までですか",
+        "expected_class": "店舗情報",
+        "memo": "",
+    },
+    # {
+    #     "query": "...",
+    #     "expected_class": "...",
+    #     "memo": "...",
+    # },
+]
+
+
+# ============================================================
+# 実装
+# ============================================================
+
+@dataclass
+class NodeResult:
+    """ワークフローノードの実行結果"""
+    node_id: str
+    node_type: str
+    title: str
+    status: str
+    elapsed: float
+    outputs: dict = field(default_factory=dict)
+    # Question Classifier 固有
+    selected_class: str = ""
+
+
+@dataclass
+class CaseResult:
+    """1テストケースの結果"""
+    index: int
+    query: str
+    expected_class: str
+    memo: str
+    answer: str = ""
+    conversation_id: str = ""
+    message_id: str = ""
+    # ノード実行ログ
+    nodes: list[NodeResult] = field(default_factory=list)
+    # 分類結果 (Question Classifier から抽出)
+    actual_class: str = ""
+    class_match: bool | None = None  # expected_class 空欄なら None
+    # メタ
+    total_tokens: int = 0
+    latency: float = 0.0
+    error: str = ""
+
+
+def load_excel_cases(path: str, sheet: str | None = None) -> list[dict]:
+    """Excel からテストケースを読み込む"""
+    try:
+        import openpyxl
+    except ImportError:
+        print("ERROR: openpyxl が必要です → pip install openpyxl")
+        sys.exit(1)
+
+    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    ws = wb[sheet] if sheet else wb.active
+    rows = list(ws.iter_rows(values_only=True))
+    wb.close()
+
+    if not rows:
+        return []
+
+    # ヘッダー行を検出 (query 列必須)
+    header = [str(c).strip().lower() if c else "" for c in rows[0]]
+    if "query" not in header:
+        print(f"ERROR: Excel の先頭行に 'query' 列が見つかりません: {header}")
+        sys.exit(1)
+
+    cases = []
+    for row in rows[1:]:
+        d = {}
+        for i, col_name in enumerate(header):
+            if col_name and i < len(row):
+                d[col_name] = str(row[i]).strip() if row[i] is not None else ""
+        if d.get("query"):
+            cases.append({
+                "query": d["query"],
+                "expected_class": d.get("expected_class", ""),
+                "memo": d.get("memo", ""),
+            })
+    return cases
+
+
+def parse_sse_stream(response: requests.Response) -> CaseResult:
+    """SSE ストリームをパースして CaseResult を組み立てる"""
+    result = CaseResult(index=0, query="", expected_class="", memo="")
+    answer_chunks: list[str] = []
+
+    for line in response.iter_lines():
+        if not line:
+            continue
+        decoded = line.decode("utf-8", errors="replace")
+        if not decoded.startswith("data: "):
+            continue
+
+        try:
+            data = json.loads(decoded[6:])
+        except json.JSONDecodeError:
+            continue
+
+        event = data.get("event", "")
+
+        # --- テキストチャンク ---
+        if event == "message":
+            answer_chunks.append(data.get("answer", ""))
+
+        # --- メッセージ完了 ---
+        elif event == "message_end":
+            result.conversation_id = data.get("conversation_id", "")
+            result.message_id = data.get("message_id", "")
+            meta = data.get("metadata", {})
+            usage = meta.get("usage", {})
+            result.total_tokens = usage.get("total_tokens", 0)
+            result.latency = usage.get("latency", 0.0)
+
+        # --- ノード完了 (ここで Question Classifier を捕捉) ---
+        elif event == "node_finished":
+            nd = data.get("data", {})
+            node = NodeResult(
+                node_id=nd.get("node_id", ""),
+                node_type=nd.get("node_type", ""),
+                title=nd.get("title", ""),
+                status=nd.get("status", ""),
+                elapsed=nd.get("elapsed_time", 0.0),
+                outputs=nd.get("outputs", {}) or {},
+            )
+            # Question Classifier の分類結果を抽出
+            if node.node_type == "question-classifier":
+                # outputs.class_name に分類名が入る (Dify の実装依存)
+                node.selected_class = (
+                    node.outputs.get("class_name", "")
+                    or node.outputs.get("class_id", "")
+                    or _extract_class_from_outputs(node.outputs)
+                )
+                if node.selected_class:
+                    result.actual_class = node.selected_class
+
+            result.nodes.append(node)
+
+        # --- ワークフロー完了 ---
+        elif event == "workflow_finished":
+            wd = data.get("data", {})
+            if wd.get("status") == "failed":
+                result.error = wd.get("error", "workflow failed")
+
+        # --- エラー ---
+        elif event == "error":
+            result.error = data.get("message", str(data))
+
+    result.answer = "".join(answer_chunks)
+    return result
+
+
+def _extract_class_from_outputs(outputs: dict) -> str:
+    """Question Classifier の出力形式が変わった場合のフォールバック"""
+    # outputs 全体から分類っぽい値を探す
+    for key in ("class_name", "class_id", "category", "classification", "result"):
+        if key in outputs:
+            return str(outputs[key])
+    return ""
+
+
+def send_chat_message(
+    query: str,
+    conversation_id: str = "",
+) -> CaseResult:
+    """Dify chatflow API にストリーミングリクエストを送信"""
+    payload = {
+        "query": query,
+        "user": TEST_USER,
+        "inputs": INPUTS,
+        "response_mode": "streaming",
+        "conversation_id": conversation_id,
+    }
+    headers = {
+        "Authorization": f"Bearer {API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    resp = requests.post(API_URL, headers=headers, json=payload, stream=True, timeout=300)
+    resp.raise_for_status()
+    return parse_sse_stream(resp)
+
+
+def format_case_log(cr: CaseResult) -> str:
+    """1ケース分のログ文字列を生成"""
+    lines = [
+        f"{'='*70}",
+        f"[Case #{cr.index:03d}] {cr.memo}" if cr.memo else f"[Case #{cr.index:03d}]",
+        f"  Query           : {cr.query}",
+        f"  Expected Class  : {cr.expected_class or '(未指定)'}",
+        f"  Actual Class    : {cr.actual_class or '(未検出)'}",
+        f"  Class Match     : {_match_label(cr.class_match)}",
+        f"  Answer (先頭200): {cr.answer[:200]}{'...' if len(cr.answer) > 200 else ''}",
+        f"  Tokens          : {cr.total_tokens}",
+        f"  Latency         : {cr.latency:.2f}s",
+        f"  Conversation    : {cr.conversation_id}",
+    ]
+    if cr.error:
+        lines.append(f"  *** ERROR ***    : {cr.error}")
+
+    # ノード実行サマリー
+    if cr.nodes:
+        lines.append(f"  --- Nodes ({len(cr.nodes)}) ---")
+        for n in cr.nodes:
+            tag = ""
+            if n.node_type == "question-classifier":
+                tag = f"  → class: {n.selected_class or '?'}"
+            lines.append(
+                f"    [{n.status:>9s}] {n.title} ({n.node_type}) "
+                f"{n.elapsed:.2f}s{tag}"
+            )
+
+    return "\n".join(lines)
+
+
+def _match_label(v: bool | None) -> str:
+    if v is None:
+        return "—"
+    return "✓ MATCH" if v else "✗ MISMATCH"
+
+
+def main():
+    # --- テストケース収集 ---
+    cases: list[dict] = []
+
+    if EXCEL_PATH and Path(EXCEL_PATH).exists():
+        excel_cases = load_excel_cases(EXCEL_PATH, EXCEL_SHEET)
+        print(f"Excel から {len(excel_cases)} 件読み込み: {EXCEL_PATH}")
+        cases.extend(excel_cases)
+
+    cases.extend(INLINE_CASES)
+
+    if not cases:
+        print("ERROR: テストケースが0件です。INLINE_CASES または EXCEL_PATH を設定してください。")
+        sys.exit(1)
+
+    print(f"テストケース合計: {len(cases)} 件")
+    print(f"API: {API_URL}")
+    print(f"会話リセット: {'毎回' if RESET_CONVERSATION_PER_CASE else '継続'}")
+    print()
+
+    # --- ログファイル準備 ---
+    log_dir = Path(LOG_DIR) if LOG_DIR else Path(".")
+    log_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = log_dir / f"dify_test_{timestamp}.log"
+
+    # --- 実行 ---
+    results: list[CaseResult] = []
+    conversation_id = ""
+
+    with open(log_path, "w", encoding="utf-8") as logf:
+        header_msg = (
+            f"Dify Chatflow Test — {timestamp}\n"
+            f"API: {API_URL}\n"
+            f"Cases: {len(cases)}\n"
+            f"{'='*70}\n"
+        )
+        logf.write(header_msg)
+        print(header_msg, end="")
+
+        for i, case in enumerate(cases, 1):
+            query = case["query"]
+            expected = case.get("expected_class", "")
+            memo = case.get("memo", "")
+
+            if RESET_CONVERSATION_PER_CASE:
+                conversation_id = ""
+
+            print(f"[{i}/{len(cases)}] {query[:50]}...", end=" ", flush=True)
+
+            try:
+                cr = send_chat_message(query, conversation_id)
+                cr.index = i
+                cr.query = query
+                cr.expected_class = expected
+                cr.memo = memo
+
+                # 分類一致判定
+                if expected:
+                    cr.class_match = (
+                        cr.actual_class.strip().lower() == expected.strip().lower()
+                    )
+
+                # 会話ID引き継ぎ
+                if not RESET_CONVERSATION_PER_CASE and cr.conversation_id:
+                    conversation_id = cr.conversation_id
+
+                print(f"{'OK' if not cr.error else 'ERR'} "
+                      f"[class={cr.actual_class or '-'}] "
+                      f"[{cr.total_tokens}tok / {cr.latency:.1f}s]")
+
+            except Exception as e:
+                cr = CaseResult(
+                    index=i, query=query, expected_class=expected,
+                    memo=memo, error=str(e),
+                )
+                print(f"EXCEPTION: {e}")
+
+            results.append(cr)
+            log_entry = format_case_log(cr) + "\n\n"
+            logf.write(log_entry)
+            logf.flush()
+
+            if i < len(cases):
+                time.sleep(REQUEST_INTERVAL)
+
+        # --- サマリー ---
+        summary = build_summary(results)
+        logf.write(summary)
+        print(summary)
+
+    print(f"\nログ保存先: {log_path.resolve()}")
+
+
+def build_summary(results: list[CaseResult]) -> str:
+    """全体サマリーを生成"""
+    total = len(results)
+    errors = sum(1 for r in results if r.error)
+    ok = total - errors
+
+    # 分類精度 (expected_class が指定されたケースのみ)
+    classified = [r for r in results if r.expected_class]
+    class_total = len(classified)
+    class_match = sum(1 for r in classified if r.class_match)
+    class_miss = [r for r in classified if r.class_match is False]
+
+    # トークン・レイテンシ統計
+    latencies = [r.latency for r in results if r.latency > 0]
+    tokens = [r.total_tokens for r in results if r.total_tokens > 0]
+
+    lines = [
+        f"\n{'='*70}",
+        f"SUMMARY",
+        f"{'='*70}",
+        f"  Total cases     : {total}",
+        f"  Success / Error : {ok} / {errors}",
+    ]
+
+    if class_total:
+        acc = class_match / class_total * 100
+        lines.append(f"  Classification  : {class_match}/{class_total} ({acc:.1f}%)")
+        if class_miss:
+            lines.append(f"  Mismatches:")
+            for r in class_miss:
+                lines.append(
+                    f"    #{r.index:03d} expected={r.expected_class!r} "
+                    f"actual={r.actual_class!r} query={r.query[:40]}"
+                )
+    else:
+        lines.append(f"  Classification  : (expected_class 未指定のため判定なし)")
+
+    if latencies:
+        lines.append(
+            f"  Latency         : "
+            f"avg={sum(latencies)/len(latencies):.2f}s / "
+            f"min={min(latencies):.2f}s / max={max(latencies):.2f}s"
+        )
+    if tokens:
+        lines.append(
+            f"  Tokens          : "
+            f"avg={sum(tokens)//len(tokens)} / "
+            f"total={sum(tokens)}"
+        )
+
+    lines.append(f"{'='*70}")
+    return "\n".join(lines) + "\n"
+
+
+if __name__ == "__main__":
+    main()
