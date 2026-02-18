@@ -115,15 +115,29 @@ def chat(query: str, user: str = "user-001", conversation_id: str = "") -> dict:
 | クライアントVPN | 親会社ネットワークへのVPNアカウント発行 | 親会社 管理者 |
 | リバースプロキシ | Difyが外部公開されている可能性（低） | Dify管理者 |
 
-### 3.3 疎通確認コマンド
+### 3.3 疎通確認コマンド（PowerShell）
 
-```bash
-curl -s -o /dev/null -w "%{http_code}" http://10.60.xxx.xxx/v1/parameters \
-  -H "Authorization: Bearer app-your-key"
+```powershell
+try {
+    $response = Invoke-WebRequest -Uri "http://10.60.xxx.xxx/v1/parameters" `
+        -Headers @{ "Authorization" = "Bearer app-your-key" } `
+        -Method Get -TimeoutSec 10 -UseBasicParsing
+    Write-Host "Status: $($response.StatusCode) → ネットワーク到達可（API利用可能）"
+} catch {
+    $code = $_.Exception.Response.StatusCode.value__
+    if ($code) {
+        Write-Host "Status: $code → ネットワーク到達可（認証エラー等、API Key要確認）"
+    } else {
+        Write-Host "接続失敗: $($_.Exception.Message) → 経路なし（管理者へ依頼が必要）"
+    }
+}
 ```
 
-- **200 or 401** → ネットワーク到達可（API利用可能）
-- **タイムアウト / 接続拒否** → 経路なし（管理者へ依頼が必要）
+| 結果 | 判定 |
+|---|---|
+| Status: 200 | ネットワーク到達可、API利用可能 |
+| Status: 401 / 403 | ネットワーク到達可、API Key等の認証設定を確認 |
+| 接続失敗（タイムアウト等） | 経路なし、管理者へ依頼が必要 |
 
 ---
 
